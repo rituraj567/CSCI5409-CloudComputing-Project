@@ -1,0 +1,840 @@
+# reference for cloudformation templates: https://aws.amazon.com/cloudformation/resources/templates/
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  CreateBlogLambdaFunctionName:
+    Type: String
+    Default: createBlogLambdaFunction
+  ReadBlogLambdaFunctionName:
+    Type: String
+    Default: readBlogLambdaFunction
+  GetPostIdLambdaFunctionName:
+    Type: String
+    Default: getPostIdLambdaFunction
+  UpdateBlogLambdaFunctionName:
+    Type: String
+    Default: updatePostLambdaFunction
+  DeleteBlogLambdaFunctionName:
+    Type: String
+    Default: deleteBlogLambdaFunction
+  GetAllPostsLambdaFunctionName:
+    Type: String
+    Default: getAllPostsLambdaFunction
+
+  BlogApplicationAPI:
+    Type: String
+    Default: blogAppAPI
+  APIPathName:
+    Type: String
+    Default: post
+  PostsAPIPathName:
+    Type: String
+    Default: posts
+  PostIdAPIPathName:
+    Type: String
+    Default: "postid"
+  EnvironmentName:
+    Type: String
+    Default: dev
+
+Resources:
+  BlogPostQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: "createSQSQueue"
+
+  BlogPostSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint:
+            Fn::GetAtt:
+              - "BlogPostQueue"
+              - "Arn"
+          Protocol: "sqs"
+      TopicName: "createSNSBlogTopic"
+
+  NotificationsDynamoDBTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "id"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "id"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: "notificationsTable"
+
+ #reference: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sns-subscription.html
+  BlogPostQueueTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: { "Fn::GetAtt": ["BlogPostQueue", "Arn"] }
+      FunctionName: { "Ref": "NotificationsLambdaFunction" }
+
+  NotificationsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event, context) => {
+            try {
+              console.log('Received event:', JSON.stringify(event));
+              
+              const message = JSON.parse(event.Records[0].body);
+              const { postId, title } = message;
+              
+              const params = {
+                TableName: "notificationsTable",
+                Item: {
+                  id:postId,
+                  title,
+                  timestamp: new Date().toISOString(),
+                },
+              };
+
+              await dynamoDB.put(params).promise();
+              
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Notification created successfully" }),
+              };
+            } catch (err) {
+              console.error(err);
+              
+              return {
+                statusCode: 500,
+                body: JSON.stringify({
+                  message: "Unable to create notification",
+                  error: err.message,
+                }),
+              };
+            }
+          };
+
+      FunctionName: "NotificationLambdaFunction"
+      Handler: "index.handler"
+      Runtime: nodejs12.x
+      Role: "arn:aws:iam::658202679925:role/LabRole"
+      Environment:
+        Variables:
+          TABLE_NAME: "notificationsTable"
+    DependsOn:
+      - NotificationsDynamoDBTable
+
+  CreateBlogLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+           const sns = new AWS.SNS();
+           const dynamoDB = new AWS.DynamoDB.DocumentClient();
+           const sqs = new AWS.SQS();
+
+           exports.handler = async (event, context) => {
+             const { title, content, author, datePosted, tags, comments, likes, image, emailId, userId } = event;
+             const id = Math.floor(Math.random() * 1000000).toString();
+
+             const params = {
+               TableName: 'postsTable',
+               Item: {
+                 id,
+                 title,
+                 content,
+                 author,
+                 datePosted,
+                 tags,
+                 comments,
+                 likes,
+                 image,
+                 emailId,
+                 userId
+               }
+             };
+
+             const topicArn = 'arn:aws:sns:us-east-1:658202679925:createBlogTopic';
+
+              # #reference: https://docs.aws.amazon.com/sns/latest/api/API_ListSubscriptionsByTopic.html
+             const subscriptions = await sns.listSubscriptionsByTopic({ TopicArn: topicArn }).promise();
+             const alreadySubscribed = subscriptions.Subscriptions.some(subscription => subscription.Protocol === 'email' && subscription.Endpoint === emailId);
+
+             if (!alreadySubscribed) {
+
+               const subscribeParams = {
+                 Protocol: 'email',
+                 TopicArn: topicArn,
+                 Endpoint: emailId
+               };
+               await sns.subscribe(subscribeParams).promise();
+             }
+
+             const message = {
+               Message: JSON.stringify({ message:`Blog post named: ${title} is published by you at this date: ${datePosted}` }),
+               TopicArn: topicArn,
+               MessageAttributes: {
+                 email: {
+                   DataType: 'String',
+                   StringValue: emailId
+                 }
+               }
+             };
+             await sns.publish(message).promise();
+
+             try {
+              # reference: https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/DynamoDB.html
+               await dynamoDB.put(params).promise();
+               const message = {
+                 Message: JSON.stringify({ postId: id, title }),
+                 TopicArn: topicArn,
+               };
+
+               const sqsParams = {
+                 MessageBody: JSON.stringify({ postId: id, title }),
+                 QueueUrl: "https://sqs.us-east-1.amazonaws.com/658202679925/createPostQueue",
+               };
+
+              # reference: https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/SQS.html
+               await sqs.sendMessage(sqsParams).promise();
+               return {
+                 statusCode: 200,
+                 body: JSON.stringify({ message: "Blog post created successfully" }),
+               };
+             } catch (err) {
+               return {
+                 statusCode: 500,
+                 body: JSON.stringify({
+                   message: "Unable to create blog post",
+                   error: err,
+                 }),
+               };
+             }
+           };
+
+      FunctionName:
+        Ref: CreateBlogLambdaFunctionName
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Role: arn:aws:iam::658202679925:role/LabRole
+    DependsOn:
+      - DynamoDBTable
+
+  GetAllPostsLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event) => {
+            try {
+              const params = {
+                TableName: 'postsTable'
+              };
+              
+              const data = await dynamoDB.scan(params).promise();
+              
+              return {
+                statusCode: 200,
+                headers: {
+                  'Content-Type': 'application/json'
+                },
+                posts: data.Items
+              };
+            } catch (error) {
+              console.error(error);
+              return {
+                statusCode: 500,
+                body: 'Error getting blog posts'
+              };
+            }
+            
+          };
+
+      FunctionName:
+        Ref: GetAllPostsLambdaFunctionName
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Role: arn:aws:iam::658202679925:role/LabRole
+    DependsOn:
+      - DynamoDBTable
+
+  GetPostIdLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event, context) => {
+            const { id } = event;
+            const params = {
+              TableName: "postsTable",
+              Key: { id },
+            };
+
+            try {
+              const { Item } = await dynamoDB.get(params).promise();
+              return {
+                statusCode: 200,
+                body: JSON.stringify({
+                  message: "Blog post retrieved successfully",
+                  data: Item,
+                }),
+              };
+            } catch (err) {
+              return {
+                statusCode: 500,
+                body: JSON.stringify({
+                  message: "Unable to retrieve blog post",
+                  error: err,
+                }),
+              };
+            }
+          };
+
+      FunctionName:
+        Ref: GetPostIdLambdaFunctionName
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Role: arn:aws:iam::658202679925:role/LabRole
+    DependsOn:
+      - DynamoDBTable
+
+  UpdateBlogLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event, context) => {
+            const {
+              id,
+              title,
+              content,
+              author,
+              datePosted,
+              tags,
+              comments,
+              likes,
+              image,
+              userId,
+              firstName,
+              lastName,
+              emailId
+            } = event;
+
+            # reference: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/example_dynamodb_UpdateItem_section.html
+            const params = {
+              TableName: "postsTable",
+              Key: { id },
+              UpdateExpression:
+                "set title = :t, content = :c, author = :a, #dt = :d, tags = :tg, comments = :cm, likes = :l, image = :i, firstName= :f, lastName=:l, emailId=:e,userId=:u",
+              ExpressionAttributeValues: {
+                ":t": title,
+                ":c": content,
+                ":a": author,
+                ":d": datePosted,
+                ":tg": tags,
+                ":cm": comments,
+                ":l": likes,
+                ":i": image,
+                ":u": userId,
+                ":f":firstName,
+                ":l":lastName,
+                ":e":emailId
+              },
+              ExpressionAttributeNames: {
+                "#dt": "date", 
+              },
+            };
+
+            try {
+              await dynamoDB.update(params).promise();
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Blog post updated successfully" }),
+              };
+            } catch (err) {
+              return {
+                statusCode: 500,
+                body: JSON.stringify({
+                  message: "Unable to update blog post",
+                  error: err,
+                }),
+              };
+            }
+          };
+
+      FunctionName:
+        Ref: UpdateBlogLambdaFunctionName
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Role: arn:aws:iam::658202679925:role/LabRole
+    DependsOn:
+      - DynamoDBTable
+
+  ReadBlogLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event, context) => {
+              const { id } = event;
+            const params = {
+              TableName: 'postsTable',
+              Key: { id }
+            };
+
+            try {
+              const { Item } = await dynamoDB.get(params).promise();
+              return {
+                statusCode: 200,
+               post: Item 
+              };
+            } catch (err) {
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: 'Unable to retrieve blog post', error: err })
+              };
+            }
+          };
+
+      FunctionName:
+        Ref: ReadBlogLambdaFunctionName
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Role: arn:aws:iam::658202679925:role/LabRole
+    DependsOn:
+      - DynamoDBTable
+
+  DeleteBlogLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require("aws-sdk");
+
+          const dynamoDB = new AWS.DynamoDB.DocumentClient();
+
+          exports.handler = async (event, context) => {
+            const { id } = event;
+
+            const params = {
+              TableName: "postsTable",
+              Key: { id },
+            };
+
+            try {
+              await dynamoDB.delete(params).promise();
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: "Blog post deleted successfully" }),
+              };
+            } catch (err) {
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: "Unable to delete post", error: err }),
+              };
+            }
+          };
+      FunctionName:
+        Ref: DeleteBlogLambdaFunctionName
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Role: arn:aws:iam::658202679925:role/LabRole
+    DependsOn:
+      - DynamoDBTable
+
+  DynamoDBTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "id"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "id"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: "postsTable"
+
+  # reference: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-restapi.html
+  APIGatewayRestAPI:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name:
+        Ref: BlogApplicationAPI
+
+    DependsOn:
+      - CreateBlogLambdaFunction
+
+  APIGatewayResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart:
+        Ref: APIPathName
+    DependsOn:
+      - APIGatewayRestAPI
+
+  # reference for all option methods: https://stackoverflow.com/questions/40292888/enable-cors-for-api-gateway-in-cloudformation-template
+  OptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,PUT,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  APIGatewayPostsResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart:
+        Ref: PostsAPIPathName
+    DependsOn:
+      - APIGatewayRestAPI
+
+  OptionsMethodPosts:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayPostsResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  APIGatewayPostIdResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart:
+        Ref: PostIdAPIPathName
+    DependsOn:
+      - APIGatewayRestAPI
+
+  OptionsMethodPostsId:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayPostIdResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  PostBlogAPIMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt CreateBlogLambdaFunction.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        PassthroughBehavior: WHEN_NO_MATCH
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+    DependsOn:
+      - APIGatewayResource
+
+  ReadBlogAPIMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayPostIdResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt ReadBlogLambdaFunction.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+    DependsOn:
+      - APIGatewayResource
+
+  GetAllBlogsAPIMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayPostsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt GetAllPostsLambdaFunction.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+    DependsOn:
+      - APIGatewayPostsResource
+
+  UpdateBlogAPIMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt UpdateBlogLambdaFunction.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+
+      MethodResponses:
+        - StatusCode: 200
+    DependsOn:
+      - APIGatewayResource
+
+  DeleteBlogAPIMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt DeleteBlogLambdaFunction.Arn
+        RequestParameters:
+          integration.request.path.id: "'true'"
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+    DependsOn:
+      - APIGatewayResource
+
+  APIGatewayDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      StageName:
+        Ref: EnvironmentName
+    DependsOn:
+      [
+        PostBlogAPIMethod,
+        ReadBlogAPIMethod,
+        UpdateBlogAPIMethod,
+        DeleteBlogAPIMethod,
+        GetAllBlogsAPIMethod,
+      ]
+
+  CreateBlogPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CreateBlogLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+
+  GetAllPostsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GetAllPostsLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+
+  UpdatePostPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UpdateBlogLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+
+  ReadBlogPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ReadBlogLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+
+  DeleteBlogPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DeleteBlogLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+
+  #reference: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpool.html
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: my-user-pool
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: "OFF"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+
+  AppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: blogClient
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - USER_PASSWORD_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  HostedUI:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: sampledomainnewlatest
+      UserPoolId: !Ref UserPool
+
+  # reference: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-authorizer.html
+  CognitoAuthorizer:
+    Type: "AWS::ApiGateway::Authorizer"
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      Name: "Authorizer"
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+      AuthType: "cognito_auth"
